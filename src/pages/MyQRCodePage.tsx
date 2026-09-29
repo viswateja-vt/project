@@ -23,7 +23,7 @@ import {
   type QRType,
 } from '../lib/qrTypes';
 
-export function CreateQRPage() {
+export function MyQRCodePage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
 
