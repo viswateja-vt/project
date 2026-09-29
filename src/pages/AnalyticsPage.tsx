@@ -10,7 +10,8 @@ import {
   Tablet,
   TrendingUp,
 } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { supabase } from '../lib/supabase';
 
 import { DashboardLayout } from '../components/DashboardLayout';
 import {
@@ -44,14 +45,55 @@ interface BreakdownItem {
 }
 
 const QR_STORAGE_KEY = 'qr-studio-codes';
-const SCAN_STORAGE_KEY = 'qr-studio-scan-events';
 
 export function AnalyticsPage() {
   const [period, setPeriod] = useState<Period>('30d');
   const [showPeriodMenu, setShowPeriodMenu] = useState(false);
 
   const qrCodes = useMemo(() => getStoredQRCodes(), []);
-  const scanEvents = useMemo(() => getStoredScanEvents(), []);
+  const [scanEvents, setScanEvents] = useState<ScanEvent[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadScanEvents() {
+      const { data, error } = await supabase
+        .from('qr_scans')
+        .select(
+          'id, qr_id, scanned_at, device, browser, country, city, referrer',
+        )
+        .order('scanned_at', { ascending: false });
+
+      if (cancelled) return;
+
+      if (error) {
+        console.error('Failed to load analytics scan events:', error);
+        setScanEvents([]);
+      } else {
+        setScanEvents(
+          (data ?? []).map((event) => ({
+            id: event.id,
+            qrId: event.qr_id,
+            scannedAt: event.scanned_at,
+            device: normalizeDevice(event.device),
+            browser: event.browser ?? undefined,
+            country: event.country ?? undefined,
+            city: event.city ?? undefined,
+            referrer: event.referrer ?? undefined,
+          })),
+        );
+      }
+
+      setLoading(false);
+    }
+
+    loadScanEvents();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const now = Date.now();
 
@@ -118,7 +160,7 @@ export function AnalyticsPage() {
   );
 
   const qrPerformance = useMemo(
-    () => buildQRPerformance(qrCodes, selectedEvents),
+    () => buildQRPerformance(qrCodes, scanEvents, selectedEvents),
     [qrCodes, selectedEvents],
   );
 
@@ -193,7 +235,7 @@ export function AnalyticsPage() {
           <AnalyticsStat
             icon={ScanLine}
             label={`Scans · ${getPeriodLabel(period)}`}
-            value={totalScans.toLocaleString()}
+            value={loading ? '—' : totalScans.toLocaleString()}
             change={
               previousPeriodEvents.length === 0 && totalScans > 0
                 ? 'No previous data'
@@ -225,7 +267,7 @@ export function AnalyticsPage() {
           <AnalyticsStat
             icon={TrendingUp}
             label="Recorded scan events"
-            value={scanEvents.length.toLocaleString()}
+            value={loading ? '—' : scanEvents.length.toLocaleString()}
             change="Actual events only"
             positive
           />
@@ -583,6 +625,20 @@ function EmptyAnalyticsState({
   );
 }
 
+function normalizeDevice(
+  device?: string | null,
+): ScanEvent['device'] {
+  if (!device) return undefined;
+
+  const value = device.toLowerCase();
+
+  if (value === 'mobile') return 'mobile';
+  if (value === 'tablet') return 'tablet';
+  if (value === 'desktop') return 'desktop';
+
+  return undefined;
+}
+
 function getStoredQRCodes(): QRRecord[] {
   try {
     const raw = localStorage.getItem(QR_STORAGE_KEY);
@@ -603,24 +659,230 @@ function getStoredQRCodes(): QRRecord[] {
   }
 }
 
-function getStoredScanEvents(): ScanEvent[] {
-  try {
-    const raw = localStorage.getItem(SCAN_STORAGE_KEY);
+function buildChartData(
+  events: ScanEvent[],
+  period: Period,
+  now: number,
+): ChartPoint[] {
+  const buckets = getChartBuckets(period, now);
 
-    if (!raw) {
-      return [];
-    }
+  return buckets.map((bucket) => ({
+    label: bucket.label,
+    scans: events.filter((event) => {
+      const timestamp = new Date(event.scannedAt).getTime();
+      return timestamp >= bucket.start && timestamp < bucket.end;
+    }).length,
+  }));
+}
 
-    const parsed = JSON.parse(raw);
+function getChartBuckets(
+  period: Period,
+  now: number,
+): Array<{ label: string; start: number; end: number }> {
+  const date = new Date(now);
 
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
+  if (period === '12m') {
+    return Array.from({ length: 12 }, (_, index) => {
+      const start = new Date(
+        date.getFullYear(),
+        date.getMonth() - (11 - index),
+        1,
+      );
+      const end = new Date(
+        start.getFullYear(),
+        start.getMonth() + 1,
+        1,
+      );
 
-    return parsed.filter(isScanEvent);
-  } catch {
-    return [];
+      return {
+        label: start.toLocaleDateString(undefined, {
+          month: 'short',
+        }),
+        start: start.getTime(),
+        end: end.getTime(),
+      };
+    });
   }
+
+  const days = period === '7d' ? 7 : period === '30d' ? 30 : 90;
+  const bucketCount = period === '7d' ? 7 : period === '30d' ? 10 : 13;
+  const bucketSize = Math.ceil(days / bucketCount);
+
+  return Array.from({ length: bucketCount }, (_, index) => {
+    const end = new Date(date);
+    end.setHours(23, 59, 59, 999);
+    end.setDate(end.getDate() - (bucketCount - 1 - index) * bucketSize);
+
+    const start = new Date(end);
+    start.setDate(start.getDate() - bucketSize + 1);
+    start.setHours(0, 0, 0, 0);
+
+    return {
+      label:
+        period === '7d'
+          ? start.toLocaleDateString(undefined, {
+              weekday: 'short',
+            })
+          : start.toLocaleDateString(undefined, {
+              month: 'short',
+              day: 'numeric',
+            }),
+      start: start.getTime(),
+      end: end.getTime() + 1,
+    };
+  });
+}
+
+function buildDeviceBreakdown(
+  events: ScanEvent[],
+): BreakdownItem[] {
+  const counts = new Map<string, number>();
+
+  for (const event of events) {
+    if (!event.device) continue;
+    counts.set(
+      event.device,
+      (counts.get(event.device) ?? 0) + 1,
+    );
+  }
+
+  return Array.from(counts.entries())
+    .map(([label, value]) => ({
+      label: label.charAt(0).toUpperCase() + label.slice(1),
+      value,
+      icon:
+        label === 'mobile'
+          ? Smartphone
+          : label === 'tablet'
+            ? Tablet
+            : MonitorSmartphone,
+    }))
+    .sort((a, b) => b.value - a.value);
+}
+
+function buildCountryBreakdown(
+  events: ScanEvent[],
+): BreakdownItem[] {
+  const counts = new Map<string, number>();
+
+  for (const event of events) {
+    const country = event.country?.trim();
+    if (!country) continue;
+
+    counts.set(country, (counts.get(country) ?? 0) + 1);
+  }
+
+  return Array.from(counts.entries())
+    .map(([label, value]) => ({ label, value }))
+    .sort((a, b) => b.value - a.value);
+}
+
+function buildQRPerformance(
+  qrCodes: QRRecord[],
+  allEvents: ScanEvent[],
+  periodEvents: ScanEvent[],
+) {
+  return qrCodes.map((qr) => {
+    const totalScans = allEvents.filter(
+      (event) => event.qrId === qr.id,
+    ).length;
+
+    const periodScans = periodEvents.filter(
+      (event) => event.qrId === qr.id,
+    ).length;
+
+    return {
+      id: qr.id,
+      name: qr.name,
+      type: qr.type,
+      scans: totalScans,
+      periodScans,
+    };
+  });
+}
+
+function getPeriodStart(
+  period: Period,
+  now: number,
+): number {
+  const date = new Date(now);
+
+  if (period === '7d') {
+    date.setDate(date.getDate() - 7);
+  } else if (period === '30d') {
+    date.setDate(date.getDate() - 30);
+  } else if (period === '90d') {
+    date.setDate(date.getDate() - 90);
+  } else {
+    date.setFullYear(date.getFullYear() - 1);
+  }
+
+  return date.getTime();
+}
+
+function getPreviousPeriodStart(
+  period: Period,
+  periodStart: number,
+): number {
+  const start = new Date(periodStart);
+
+  if (period === '7d') {
+    start.setDate(start.getDate() - 7);
+  } else if (period === '30d') {
+    start.setDate(start.getDate() - 30);
+  } else if (period === '90d') {
+    start.setDate(start.getDate() - 90);
+  } else {
+    start.setFullYear(start.getFullYear() - 1);
+  }
+
+  return start.getTime();
+}
+
+function calculatePercentageChange(
+  previous: number,
+  current: number,
+): number {
+  if (previous === 0) {
+    return 0;
+  }
+
+  return ((current - previous) / previous) * 100;
+}
+
+function formatPercentageChange(value: number): string {
+  if (!Number.isFinite(value)) {
+    return '—';
+  }
+
+  const rounded = Math.round(value * 10) / 10;
+
+  return `${rounded > 0 ? '+' : ''}${rounded}%`;
+}
+
+function getPeriodLabel(period: Period): string {
+  switch (period) {
+    case '7d':
+      return 'Last 7 days';
+    case '30d':
+      return 'Last 30 days';
+    case '90d':
+      return 'Last 90 days';
+    case '12m':
+      return 'Last 12 months';
+  }
+}
+
+function formatCompact(value: number): string {
+  if (value >= 1000000) {
+    return `${(value / 1000000).toFixed(1)}M`;
+  }
+
+  if (value >= 1000) {
+    return `${(value / 1000).toFixed(1)}K`;
+  }
+
+  return Math.round(value).toString();
 }
 
 function isQRRecord(value: unknown): value is QRRecord {
@@ -635,316 +897,4 @@ function isQRRecord(value: unknown): value is QRRecord {
     typeof record.name === 'string' &&
     typeof record.type === 'string'
   );
-}
-
-function isScanEvent(value: unknown): value is ScanEvent {
-  if (!value || typeof value !== 'object') {
-    return false;
-  }
-
-  const event = value as Partial<ScanEvent>;
-
-  return (
-    typeof event.id === 'string' &&
-    typeof event.qrId === 'string' &&
-    typeof event.scannedAt === 'string'
-  );
-}
-
-function buildChartData(
-  events: ScanEvent[],
-  period: Period,
-  now: number,
-): ChartPoint[] {
-  const points = getChartBuckets(period, now);
-
-  return points.map((point) => {
-    const scans = events.filter((event) => {
-      const timestamp = new Date(event.scannedAt).getTime();
-
-      return timestamp >= point.start && timestamp < point.end;
-    }).length;
-
-    return {
-      label: point.label,
-      scans,
-    };
-  });
-}
-
-function getChartBuckets(
-  period: Period,
-  now: number,
-): { label: string; start: number; end: number }[] {
-  const current = new Date(now);
-  const buckets: {
-    label: string;
-    start: number;
-    end: number;
-  }[] = [];
-
-  if (period === '7d') {
-    for (let index = 6; index >= 0; index -= 1) {
-      const date = new Date(current);
-      date.setHours(0, 0, 0, 0);
-      date.setDate(date.getDate() - index);
-
-      const end = new Date(date);
-      end.setDate(end.getDate() + 1);
-
-      buckets.push({
-        label: date.toLocaleDateString(undefined, {
-          weekday: 'short',
-        }),
-        start: date.getTime(),
-        end: end.getTime(),
-      });
-    }
-
-    return buckets;
-  }
-
-  if (period === '30d') {
-    for (let index = 5; index >= 0; index -= 1) {
-      const end = new Date(current);
-      end.setHours(0, 0, 0, 0);
-      end.setDate(end.getDate() - index * 5 + 1);
-
-      const start = new Date(end);
-      start.setDate(start.getDate() - 5);
-
-      buckets.push({
-        label: formatMonthDay(start),
-        start: start.getTime(),
-        end: end.getTime(),
-      });
-    }
-
-    return buckets;
-  }
-
-  if (period === '90d') {
-    for (let index = 2; index >= 0; index -= 1) {
-      const start = new Date(current);
-      start.setHours(0, 0, 0, 0);
-      start.setDate(start.getDate() - index * 30 - 29);
-
-      const end = new Date(current);
-      end.setHours(23, 59, 59, 999);
-      end.setDate(end.getDate() - index * 30 + 1);
-
-      buckets.push({
-        label: start.toLocaleDateString(undefined, {
-          month: 'short',
-        }),
-        start: start.getTime(),
-        end: end.getTime(),
-      });
-    }
-
-    return buckets;
-  }
-
-  for (let index = 11; index >= 0; index -= 1) {
-    const start = new Date(current.getFullYear(), current.getMonth() - index, 1);
-    const end = new Date(
-      current.getFullYear(),
-      current.getMonth() - index + 1,
-      1,
-    );
-
-    buckets.push({
-      label: start.toLocaleDateString(undefined, {
-        month: 'short',
-      }),
-      start: start.getTime(),
-      end: end.getTime(),
-    });
-  }
-
-  return buckets;
-}
-
-function buildDeviceBreakdown(events: ScanEvent[]): BreakdownItem[] {
-  const counts = new Map<string, number>();
-
-  events.forEach((event) => {
-    if (!event.device) {
-      return;
-    }
-
-    counts.set(event.device, (counts.get(event.device) || 0) + 1);
-  });
-
-  return Array.from(counts.entries())
-    .sort((a, b) => b[1] - a[1])
-    .map(([device, value]) => ({
-      label: formatDeviceName(device),
-      value,
-      icon:
-        device === 'desktop'
-          ? MonitorSmartphone
-          : device === 'tablet'
-            ? Tablet
-            : Smartphone,
-    }));
-}
-
-function buildCountryBreakdown(events: ScanEvent[]): BreakdownItem[] {
-  const counts = new Map<string, number>();
-
-  events.forEach((event) => {
-    const country = event.country?.trim();
-
-    if (!country) {
-      return;
-    }
-
-    counts.set(country, (counts.get(country) || 0) + 1);
-  });
-
-  return Array.from(counts.entries())
-    .sort((a, b) => b[1] - a[1])
-    .map(([label, value]) => ({
-      label,
-      value,
-    }));
-}
-
-function buildQRPerformance(
-  qrCodes: QRRecord[],
-  events: ScanEvent[],
-) {
-  const periodCounts = new Map<string, number>();
-  const allCounts = new Map<string, number>();
-
-  events.forEach((event) => {
-    periodCounts.set(
-      event.qrId,
-      (periodCounts.get(event.qrId) || 0) + 1,
-    );
-  });
-
-  const allEvents = getStoredScanEvents();
-
-  allEvents.forEach((event) => {
-    allCounts.set(
-      event.qrId,
-      (allCounts.get(event.qrId) || 0) + 1,
-    );
-  });
-
-  return qrCodes
-    .map((qr) => ({
-      id: qr.id,
-      name: qr.name,
-      type:
-        QR_TYPE_DEFINITIONS.find(
-          (definition) => definition.type === qr.type,
-        )?.label || qr.type,
-      scans: allCounts.get(qr.id) || 0,
-      periodScans: periodCounts.get(qr.id) || 0,
-    }))
-    .sort((a, b) => {
-      if (b.periodScans !== a.periodScans) {
-        return b.periodScans - a.periodScans;
-      }
-
-      return b.scans - a.scans;
-    });
-}
-
-function getPeriodStart(period: Period, now: number) {
-  const date = new Date(now);
-
-  if (period === '7d') {
-    date.setHours(0, 0, 0, 0);
-    date.setDate(date.getDate() - 6);
-    return date.getTime();
-  }
-
-  if (period === '30d') {
-    date.setHours(0, 0, 0, 0);
-    date.setDate(date.getDate() - 29);
-    return date.getTime();
-  }
-
-  if (period === '90d') {
-    date.setHours(0, 0, 0, 0);
-    date.setDate(date.getDate() - 89);
-    return date.getTime();
-  }
-
-  date.setHours(0, 0, 0, 0);
-  date.setMonth(date.getMonth() - 11);
-  date.setDate(1);
-
-  return date.getTime();
-}
-
-function getPreviousPeriodStart(period: Period, currentStart: number) {
-  const date = new Date(currentStart);
-
-  if (period === '7d') {
-    date.setDate(date.getDate() - 7);
-  } else if (period === '30d') {
-    date.setDate(date.getDate() - 30);
-  } else if (period === '90d') {
-    date.setDate(date.getDate() - 90);
-  } else {
-    date.setMonth(date.getMonth() - 12);
-  }
-
-  return date.getTime();
-}
-
-function calculatePercentageChange(
-  previous: number,
-  current: number,
-) {
-  if (previous === 0) {
-    return current === 0 ? 0 : 100;
-  }
-
-  return ((current - previous) / previous) * 100;
-}
-
-function formatPercentageChange(value: number) {
-  if (value === 0) {
-    return '0%';
-  }
-
-  return `${value > 0 ? '+' : ''}${value.toFixed(1)}%`;
-}
-
-function formatDeviceName(device: string) {
-  switch (device) {
-    case 'mobile':
-      return 'Mobile';
-    case 'tablet':
-      return 'Tablet';
-    case 'desktop':
-      return 'Desktop';
-    default:
-      return device;
-  }
-}
-
-function formatMonthDay(date: Date) {
-  return date.toLocaleDateString(undefined, {
-    month: 'short',
-    day: 'numeric',
-  });
-}
-
-function formatCompact(value: number) {
-  if (value >= 1000000) {
-    return `${(value / 1000000).toFixed(1)}M`;
-  }
-
-  if (value >= 1000) {
-    return `${(value / 1000).toFixed(1)}K`;
-  }
-
-  return Math.round(value).toString();
 }

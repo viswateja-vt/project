@@ -1,4 +1,3 @@
-tsx
 import {
   ArrowLeft,
   Check,

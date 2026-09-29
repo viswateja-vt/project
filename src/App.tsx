@@ -19,6 +19,7 @@ import { QRDetailPage } from './pages/QRDetailPage';
 import { AnalyticsPage } from './pages/AnalyticsPage';
 import { TemplatesPage } from './pages/TemplatesPage';
 import { MyQRCodePage } from './pages/MyQRCodePage';
+import { QRRedirectPage } from './pages/QRRedirectPage';
 
 function App() {
   return (
@@ -41,6 +42,10 @@ function App() {
               <Route
                 path="/signup"
                 element={<AuthPage mode="signup" />}
+              />
+              <Route
+                path="/r/:id"
+                element={<QRRedirectPage />}
               />
 
               {/* Protected application */}

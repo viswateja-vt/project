@@ -1,4 +1,3 @@
-tsx
 import {
   CheckCircle2,
   ExternalLink,
